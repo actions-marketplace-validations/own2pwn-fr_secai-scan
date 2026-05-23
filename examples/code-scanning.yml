@@ -1,0 +1,56 @@
+# SecAI scan + GitHub Code Scanning upload.
+#
+# The SARIF report lands in the "Security → Code scanning alerts" tab
+# on the repository, alongside any CodeQL or third-party scanner
+# results. Requires GitHub Advanced Security on private repos; public
+# repos get it for free.
+
+name: SecAI (Code Scanning)
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # Re-scan main weekly so drift in deps + new CVEs surface even
+    # without a code change.
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+  pull-requests: write
+  # Required to upload SARIF to GitHub Code Scanning.
+  security-events: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run SecAI scan
+        id: secai
+        # `continue-on-error` lets the SARIF upload step run even when
+        # the severity gate trips — findings still surface in the
+        # Security tab, the job just turns red at the end.
+        continue-on-error: true
+        uses: own2pwn-fr/secai-scan@v1
+        with:
+          api-key: ${{ secrets.SECAI_API_KEY }}
+          fail-on-severity: high
+          sarif-output: secai.sarif
+
+      - name: Upload SARIF to GitHub Code Scanning
+        if: always() && steps.secai.outputs.sarif-path != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ steps.secai.outputs.sarif-path }}
+          category: secai
+
+      - name: Mirror SecAI exit status
+        # Bubble the gate failure up after the SARIF upload, so the PR
+        # check still goes red on high-severity findings.
+        if: steps.secai.outcome == 'failure'
+        run: |
+          echo "SecAI gate failed — see the Code Scanning tab for details."
+          exit 1

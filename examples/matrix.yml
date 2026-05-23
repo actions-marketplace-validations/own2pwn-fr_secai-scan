@@ -1,0 +1,59 @@
+# SecAI scan across multiple sub-projects in a monorepo.
+#
+# Each matrix entry registers a different SecAI repository (or
+# repository-id, if you pre-register them) so findings from the
+# `apps/web` JS code don't get mixed into the `services/api` Python
+# code.
+
+name: SecAI (Matrix)
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+  security-events: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: api
+            kinds: sast,sca,secret
+            # If you have pre-registered repositories, use repository-id.
+            # Otherwise leave it unset and the action will register one
+            # called `<owner>/<repo>` automatically.
+            repository-id: 00000000-0000-0000-0000-000000000001
+            fail-on-severity: high
+          - name: web
+            kinds: sast,sca
+            repository-id: 00000000-0000-0000-0000-000000000002
+            fail-on-severity: medium
+          - name: infra
+            kinds: iac,secret
+            repository-id: 00000000-0000-0000-0000-000000000003
+            fail-on-severity: critical
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: SecAI ${{ matrix.name }}
+        uses: own2pwn-fr/secai-scan@v1
+        with:
+          api-key: ${{ secrets.SECAI_API_KEY }}
+          repository-id: ${{ matrix.repository-id }}
+          kinds: ${{ matrix.kinds }}
+          fail-on-severity: ${{ matrix.fail-on-severity }}
+          sarif-output: secai-${{ matrix.name }}.sarif
+
+      - name: Upload SARIF (${{ matrix.name }})
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: secai-${{ matrix.name }}.sarif
+          category: secai-${{ matrix.name }}

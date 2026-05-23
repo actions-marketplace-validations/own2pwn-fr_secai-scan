@@ -1,0 +1,30 @@
+# Basic SecAI scan on every pull request.
+#
+# Required secrets:
+#   - SECAI_API_KEY — generated from Settings → API keys on the SecAI dashboard.
+
+name: SecAI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  # Required so the action can post the recap comment on PRs.
+  pull-requests: write
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run SecAI scan
+        uses: own2pwn-fr/secai-scan@v1
+        with:
+          api-key: ${{ secrets.SECAI_API_KEY }}
+          # Defaults: api-url=https://secai.own2pwn.fr/api,
+          # repository=${{ github.repository }}, kinds=sast,sca,iac,secret,
+          # fail-on-severity=high, wait=true, timeout-minutes=30.

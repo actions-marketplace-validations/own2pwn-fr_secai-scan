@@ -1,0 +1,182 @@
+# SecAI Scan — GitHub Action
+#
+# Composite action that runs the SecAI AI-native AppSec scanner against
+# the current commit and (optionally) uploads SARIF to GitHub Code
+# Scanning, gates the PR on a severity threshold, and surfaces a recap
+# comment.
+#
+# Auth: pass `api-key` from a repository or org secret. Generate one
+# from the SecAI dashboard (Settings → API keys). Keys look like
+# ``sok_<prefix>_<secret>``.
+#
+# Repository resolution: by default the action resolves the GitHub
+# `owner/repo` to a SecAI repository UUID, auto-registering it the
+# first time. Override with `repository-id` (UUID) if you have already
+# registered the repo by hand.
+
+name: SecAI Scan
+description: AI-native AppSec scanner — SAST / SCA / IaC / secrets — with SARIF upload and PR gating.
+author: own2pwn
+
+branding:
+  icon: shield
+  color: blue
+
+inputs:
+  api-key:
+    description: SecAI API key (sok_<prefix>_<secret>). Store as a repo secret.
+    required: true
+  api-url:
+    description: SecAI API base URL.
+    required: false
+    default: https://secai.own2pwn.fr/api
+  repository:
+    description: GitHub repository in `owner/name` form. Used to register the repo with SecAI on first run.
+    required: false
+    default: ${{ github.repository }}
+  repository-id:
+    description: Pre-registered SecAI repository UUID. When set, skips the auto-registration round-trip.
+    required: false
+    default: ""
+  ref:
+    description: Commit SHA to scan. Defaults to the PR head or push SHA.
+    required: false
+    default: ${{ github.event.pull_request.head.sha || github.sha }}
+  kinds:
+    description: Comma-separated scan kinds — any of `sast`, `sca`, `iac`, `secret`.
+    required: false
+    default: sast,sca,iac,secret
+  fail-on-severity:
+    description: Exit non-zero if any finding is at or above this severity. One of `critical`, `high`, `medium`, `low`, `none`.
+    required: false
+    default: high
+  comment-on-pr:
+    description: Post a recap comment on the PR. Skipped when the GitHub App has already posted one (detected via HTML marker).
+    required: false
+    default: "true"
+  wait:
+    description: Wait for the scan to finish before exiting. Set to `false` to fire-and-forget.
+    required: false
+    default: "true"
+  timeout-minutes:
+    description: Max minutes to wait for the scan to finish.
+    required: false
+    default: "30"
+  sarif-output:
+    description: Path to write the SARIF report. Empty disables export.
+    required: false
+    default: secai.sarif
+  cli-version:
+    description: Version of `secai-cli` to install via pipx. `latest` pulls the most recent release from PyPI.
+    required: false
+    default: latest
+
+outputs:
+  scan-id:
+    description: UUID of the scan that was queued.
+    value: ${{ steps.scan.outputs.scan-id }}
+  status:
+    description: Terminal status of the scan — `succeeded`, `failed`, `cancelled`, `budget_exceeded`, or `queued` (when wait=false).
+    value: ${{ steps.scan.outputs.status }}
+  findings-count:
+    description: Total number of findings produced by the scan.
+    value: ${{ steps.scan.outputs.findings-count }}
+  sarif-path:
+    description: Path of the SARIF file written by the action (empty when export is disabled or the scan didn't complete).
+    value: ${{ steps.export.outputs.sarif-path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Cache pipx install
+      uses: actions/cache@v4
+      with:
+        path: ~/.local/pipx
+        key: secai-cli-${{ runner.os }}-${{ inputs.cli-version }}
+
+    - name: Install secai-cli
+      shell: bash
+      env:
+        SECAI_ACTION_CLI_VERSION: ${{ inputs.cli-version }}
+      run: |
+        set -euo pipefail
+        python -m pip install --upgrade pip pipx >/dev/null
+        if [[ "${SECAI_ACTION_CLI_VERSION}" == "latest" ]]; then
+          pipx install --force secai-cli
+        else
+          pipx install --force "secai-cli==${SECAI_ACTION_CLI_VERSION}"
+        fi
+        pipx ensurepath
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+    - name: Resolve SecAI repository ID
+      id: repo
+      shell: bash
+      env:
+        SECAI_API_BASE: ${{ inputs.api-url }}
+        SECAI_API_KEY: ${{ inputs.api-key }}
+        SECAI_ACTION_REPOSITORY: ${{ inputs.repository }}
+        SECAI_ACTION_REPOSITORY_ID: ${{ inputs.repository-id }}
+      run: |
+        set -euo pipefail
+        "${GITHUB_ACTION_PATH}/scripts/resolve_repository.sh"
+
+    - name: Queue and (optionally) wait for scan
+      id: scan
+      shell: bash
+      env:
+        SECAI_API_BASE: ${{ inputs.api-url }}
+        SECAI_API_KEY: ${{ inputs.api-key }}
+        SECAI_ACTION_REPOSITORY_ID: ${{ steps.repo.outputs.repository-id }}
+        SECAI_ACTION_KINDS: ${{ inputs.kinds }}
+        SECAI_ACTION_WAIT: ${{ inputs.wait }}
+        SECAI_ACTION_TIMEOUT_MINUTES: ${{ inputs.timeout-minutes }}
+        SECAI_ACTION_FAIL_ON_SEVERITY: ${{ inputs.fail-on-severity }}
+      run: |
+        set -euo pipefail
+        "${GITHUB_ACTION_PATH}/scripts/run_scan.sh"
+
+    - name: Export SARIF
+      id: export
+      if: steps.scan.outputs.status == 'succeeded' && inputs.sarif-output != ''
+      shell: bash
+      env:
+        SECAI_API_BASE: ${{ inputs.api-url }}
+        SECAI_API_KEY: ${{ inputs.api-key }}
+        SECAI_ACTION_SCAN_ID: ${{ steps.scan.outputs.scan-id }}
+        SECAI_ACTION_SARIF_OUTPUT: ${{ inputs.sarif-output }}
+      run: |
+        set -euo pipefail
+        "${GITHUB_ACTION_PATH}/scripts/export_sarif.sh"
+
+    - name: Post recap comment on PR
+      if: github.event_name == 'pull_request' && inputs.comment-on-pr == 'true' && steps.scan.outputs.status == 'succeeded'
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        GITHUB_PR_NUMBER: ${{ github.event.pull_request.number }}
+        SECAI_API_BASE: ${{ inputs.api-url }}
+        SECAI_API_KEY: ${{ inputs.api-key }}
+        SECAI_ACTION_SCAN_ID: ${{ steps.scan.outputs.scan-id }}
+        SECAI_ACTION_FINDINGS_COUNT: ${{ steps.scan.outputs.findings-count }}
+      run: |
+        set -euo pipefail
+        "${GITHUB_ACTION_PATH}/scripts/post_comment.sh"
+
+    - name: Enforce severity gate
+      if: steps.scan.outputs.status == 'succeeded' && inputs.fail-on-severity != 'none'
+      shell: bash
+      env:
+        SECAI_API_BASE: ${{ inputs.api-url }}
+        SECAI_API_KEY: ${{ inputs.api-key }}
+        SECAI_ACTION_SCAN_ID: ${{ steps.scan.outputs.scan-id }}
+        SECAI_ACTION_FAIL_ON_SEVERITY: ${{ inputs.fail-on-severity }}
+      run: |
+        set -euo pipefail
+        "${GITHUB_ACTION_PATH}/scripts/severity_gate.sh"
